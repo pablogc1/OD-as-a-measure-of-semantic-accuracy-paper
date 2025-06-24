@@ -1,0 +1,201 @@
+[w007104@login2 ~]$ cat rim_all_in_one_directed.slurm
+#!/bin/bash
+#SBATCH --job-name=rim_dir          # Changed job name
+#SBATCH --output=rim_dir_%j.out     # Changed output name
+#SBATCH --error=rim_dir_%j.err      # Changed error name
+#SBATCH --time=11:00:00             # Keep or adjust time as needed
+#SBATCH --mem=4G                    # Memory might need adjustment depending on N
+#SBATCH --cpus-per-task=16
+
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+# pip install --upgrade --user pip        # Usually only needed once
+# pip install --user numpy tqdm scipy     # Ensure these are available if not already
+
+python3 rim_all_in_one_directed.py      # Changed script name
+[w007104@login2 ~]$ cat rim_all_in_one_directed.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DIRECTED RIM Semantic Vector Computation
+
+This script reads a DIRECTED Pajek network file ("wiktionary_directed.net") 
+from the working directory, constructs the Markov transition matrix P 
+(using uniform weighting, P_ij = 1/out-degree(i) for the directed graph), 
+and computes:
+    Q_i = e_i * (P + P^2 + ... + P^niter)
+for each node i, where niter is set to 10.
+
+The computed semantic vectors reflect the connectivity of the DIRECTED network.
+Each vector is written to "semantic_vectors_directed.txt".
+The computation is performed in parallel using up to 16 threads, and a progress bar is displayed.
+"""
+
+import os
+import sys
+import numpy as np
+from scipy.sparse import csr_matrix
+from tqdm import tqdm
+import concurrent.futures
+
+def parse_pajek_net(filepath, option=0, alpha=0.0): # alpha is not used for option 0
+    """
+    Parse a Pajek .net file and return a transition matrix P as a SciPy CSR sparse matrix.
+    For option==0, each outgoing edge from node i is given a uniform weight (1/out-degree(i)).
+    This function assumes the input graph can be directed.
+
+    Expected .net format:
+      *Vertices <num_vertices>
+      <id> "<label>"
+      ...
+      *Arcs  (or *Edges, but *Arcs is more typical for directed)
+      <source> <target> <weight_from_definition_length_1/m_source> [optional_flag]
+      (The weight column from the Pajek file is IGNORED for option=0 when calculating P.
+       P is based purely on out-degree of the network structure read.)
+    
+    Note: The node indices in the file are assumed to be 1-indexed.
+    """
+    with open(filepath, 'r', encoding="utf-8") as f:
+        lines = f.readlines()
+    
+    header_parts = lines[0].strip().split()
+    if not header_parts or header_parts[0].lower() != "*vertices":
+        raise ValueError("The file does not start with '*Vertices'")
+    num_vertices = int(header_parts[1])
+    
+    # Find the start of the arcs section.
+    edge_start_line_idx = -1
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith(("*arcs", "*edges")): # Pajek can use *Arcs or *Edges
+            edge_start_line_idx = idx + 1
+            break
+    
+    if edge_start_line_idx == -1:
+        raise ValueError("No *Arcs or *Edges section found.")
+    
+    # rows_p, cols_p are for constructing the sparse matrix P
+    rows_p, cols_p = [], []
+    # We will calculate out-degrees based on the structure found
+    out_degree = [0] * num_vertices
+
+    # First pass to determine out-degrees from the directed graph structure
+    # and to store edge connections (ignoring Pajek weights for P matrix construction)
+    temp_edges = [] # Store (src, tgt) pairs
+    for line_num, line_content in enumerate(lines[edge_start_line_idx:], start=edge_start_line_idx):
+        parts = line_content.strip().split()
+        if len(parts) >= 2: # Need at least source and target
+            try:
+                src = int(parts[0]) - 1  # convert to 0-indexed
+                tgt = int(parts[1]) - 1
+            except ValueError:
+                print(f"Warning: Could not parse node IDs on line {line_num+1}: '{line_content.strip()}'")
+                continue
+
+            # Ignore self-loops for transition probability calculation
+            if src != tgt:
+                if 0 <= src < num_vertices and 0 <= tgt < num_vertices:
+                    temp_edges.append((src, tgt))
+                    out_degree[src] += 1
+                else:
+                    print(f"Warning: Node ID out of bounds on line {line_num+1}: src={src+1}, tgt={tgt+1}, num_vertices={num_vertices}")
+    
+    # Now construct the data for P matrix
+    data_p = []
+    for src, tgt in temp_edges:
+        if out_degree[src] > 0:
+            rows_p.append(src)
+            cols_p.append(tgt)
+            data_p.append(1.0 / out_degree[src])
+        # If out_degree[src] is 0 (sink node), it contributes no outgoing probability.
+        # Such rows in P will be all zeros, which is correct.
+
+    if option == 0:
+        P = csr_matrix((data_p, (rows_p, cols_p)), shape=(num_vertices, num_vertices), dtype=np.float64)
+    else:
+        # Placeholder for other options, e.g., using alpha for PageRank-like teleportation
+        raise NotImplementedError("Only option 0 (uniform weighting based on out-degree) is implemented.")
+    
+    return P
+
+def compute_semantic_vector(P_matrix, node_idx, num_iterations):
+    """
+    Compute the semantic vector for node i as the i-th row of Q:
+       Q_i = e_i * (P + P^2 + ... + P^num_iterations)
+    where e_i is the standard basis vector for node i.
+    This is equivalent to:
+       v_row = P_matrix.getrow(node_idx) (for k=1)
+       accum_row = v_row
+       for k=2 to num_iterations:
+           v_row = v_row @ P_matrix
+           accum_row += v_row
+    """
+    # Initial vector for k=1 step (probability distribution after 1 step)
+    # P_matrix.getrow(node_idx) is the i-th row of P
+    current_reach_vector = P_matrix.getrow(node_idx).toarray().flatten().astype(np.float64)
+    accumulated_vector = current_reach_vector.copy()
+    
+    for _ in range(1, num_iterations): # Iterate for P^2, P^3, ..., P^niter
+        # current_reach_vector @ P_matrix gives (e_i * P^k) @ P = e_i * P^(k+1)
+        current_reach_vector = (current_reach_vector.reshape(1, -1) @ P_matrix).flatten().astype(np.float64)
+        accumulated_vector += current_reach_vector
+        
+    return accumulated_vector
+
+def rim_main():
+    input_filename = "wiktionary_directed.net"   # INPUT: Directed network file
+    output_filename = "semantic_vectors_directed.txt" # OUTPUT: Semantic vectors from directed RIM
+    niter = 10          # Number of iterations for P^k sum
+    option = 0          # Use uniform weighting based on out-degree
+    # alpha is not used for option 0
+    
+    if not os.path.exists(input_filename):
+        print(f"Input file '{input_filename}' not found in the current directory: {os.getcwd()}")
+        sys.exit(1)
+    
+    print(f"Reading DIRECTED network from: {input_filename}")
+    # The 'option' parameter dictates how P is constructed.
+    # For option=0, parse_pajek_net will use 1/out-degree of the input graph.
+    P_transition_matrix = parse_pajek_net(input_filename, option=option)
+    num_vertices = P_transition_matrix.shape[0]
+    print(f"Parsed DIRECTED network with {num_vertices} vertices. Transition matrix P constructed.")
+    
+    # Prepare for parallel computation
+    semantic_vectors_list = [None] * num_vertices
+    
+    # Define worker function for parallel execution
+    def parallel_worker(node_idx_for_rim):
+        return node_idx_for_rim, compute_semantic_vector(P_transition_matrix, node_idx_for_rim, niter)
+    
+    # Use ThreadPoolExecutor for I/O-bound or mixed tasks, 
+    # ProcessPoolExecutor for CPU-bound tasks if GIL is an issue.
+    # SciPy sparse matrix operations can release GIL, so ThreadPool might be okay.
+    # Max workers can be os.cpu_count() or a specific number like 16.
+    num_workers = min(16, os.cpu_count() if os.cpu_count() else 1) 
+    print(f"Computing semantic vectors in parallel using up to {num_workers} workers...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Create a dictionary of futures
+        futures = {executor.submit(parallel_worker, i): i for i in range(num_vertices)}
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), total=num_vertices, desc="Computing semantic vectors (directed RIM)"):
+            original_node_idx, vector_result = future.result()
+            semantic_vectors_list[original_node_idx] = vector_result
+    
+    print(f"Writing semantic vectors (from DIRECTED network) to '{output_filename}'...")
+    with open(output_filename, "w", encoding="utf-8") as f_out:
+        for vector in semantic_vectors_list:
+            if vector is not None:
+                # Format each value in the vector with 32-digit precision in scientific notation
+                row_str = " ".join(f"{val:.32e}" for val in vector)
+                f_out.write(row_str + "\n")
+            else:
+                # Handle cases where a vector might not be computed (e.g., for isolated nodes if logic changed)
+                f_out.write("\n") # Write an empty line or specific placeholder
+    
+    print(f"Semantic vectors (from DIRECTED RIM) successfully written to '{output_filename}'.")
+
+def main():
+    rim_main()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,158 @@
+[w007104@login2 ~]$ cat convert_definitions_to_network_directed.slurm
+#!/bin/bash
+#SBATCH --job-name=conv_net_dir  # Changed job name
+#SBATCH --output=conv_net_dir_%j.out # Changed output name
+#SBATCH --error=conv_net_dir_%j.err  # Changed error name
+#SBATCH --time=05:00:00              # Adjusted time if needed, likely faster
+#SBATCH --mem=2G
+#SBATCH --cpus-per-task=16          # Might not need 16 if symmetrization was the heavy part
+
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+# pip install --upgrade --user pip # Usually only needed once
+# pip install --user tqdm          # Ensure tqdm is available if not already
+
+python3 convert_definitions_to_network_directed.py # Changed script namE
+[w007104@login2 ~]$ cat convert_definitions_to_network_directed.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Converts an extracted definitions file into a DIRECTED Pajek network file.
+
+Input:
+  - The input file (extracted_definitions.txt) should have lines in the format:
+      word: token1 token2 token3 ...
+  Every word (both head entries and tokens) becomes a node.
+
+Process:
+  - For each definition, a directed edge is created from the head word to each token,
+    with weight = 1/(number of tokens in that definition).
+    These are the only edges written to the output file.
+    
+Output:
+  - The resulting DIRECTED network is written in Pajek (.net) format to wiktionary_directed.net.
+    Each arc line includes its weight. An optional flag "O" (original) can be kept.
+"""
+
+import os
+from tqdm import tqdm
+
+def read_definitions(file_path):
+    """
+    Reads the definitions file and returns a dictionary mapping each head word
+    to its list of tokens. Assumes each line is in the format "word: token1 token2 token3 ...".
+    A progress bar is displayed while processing the file.
+    """
+    definitions = {}
+    # It's good practice to ensure headwords are consistent, e.g., lowercase, if not already.
+    # However, your wiktionary_definitions.py writes headwords with original casing to extracted_definitions.txt
+    # The Pajek file will reflect this. Downstream processing (like REVMAP in run_od_aggregate_full.py)
+    # handles lowercasing for lookups.
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    for line in tqdm(lines, desc="Reading definitions"):
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        head, def_text = line.split(':', 1)
+        head = head.strip() 
+        tokens = def_text.strip().split() # Tokens are already lowercase from wiktionary_definitions.py
+        if tokens:
+            definitions[head] = tokens
+    return definitions
+
+def build_directed_network(definitions):
+    """
+    Builds a directed network from the definitions.
+    Returns a set of nodes and a list of directed edges.
+    Each edge is a tuple (head, token, weight, flag).
+    The flag is kept as True (or 'O') to signify it's an original definitional link.
+    A progress bar is shown while iterating through definitions.
+    """
+    nodes = set()
+    edges = []
+    for head, tokens in tqdm(definitions.items(), desc="Building directed network", total=len(definitions)):
+        nodes.add(head) # Add headword (original case)
+        if not tokens: # Should not happen if definitions[head] = tokens implies tokens is non-empty
+            continue
+        weight = 1.0 / len(tokens)
+        for token in tokens: # Tokens are already lowercase and lemmatized
+            nodes.add(token) # Add token (lowercase, lemmatized)
+            # Edge: head (original case) -> token (lowercase, lemmatized)
+            edges.append((head, token, weight, True)) 
+    return nodes, edges
+
+# symmetrize_edges function is REMOVED
+
+def assign_indices(nodes):
+    """
+    Assigns a unique index (starting at 1) to each node.
+    Returns a dictionary mapping node -> index.
+    Nodes are sorted before assigning indices for deterministic output.
+    """
+    # Sorting nodes ensures that the mapping is consistent across runs,
+    # given the same set of nodes.
+    sorted_nodes = sorted(list(nodes)) 
+    return {node: idx + 1 for idx, node in enumerate(sorted_nodes)}
+
+def write_pajek_file(node_to_index, edges, output_file):
+    """
+    Writes the DIRECTED network to a Pajek (.net) file.
+    The vertices section lists all nodes.
+    The arcs section lists each DIRECTED edge with its weight.
+    The flag "O" is kept to indicate these are original definitional links.
+    A progress bar is displayed while writing edges.
+    """
+    with open(output_file, 'w', encoding='utf-8') as f:
+        num_vertices = len(node_to_index)
+        f.write(f"*Vertices {num_vertices}\n")
+        # Write vertices in order of their assigned index for readability
+        # Create a reverse mapping from index to node for sorted writing
+        index_to_node = {idx: node for node, idx in node_to_index.items()}
+        for idx in range(1, num_vertices + 1):
+            node = index_to_node[idx]
+            # Pajek format typically expects quoted labels if they contain spaces or special chars.
+            # Your node names are single words, but quoting is safer.
+            f.write(f'{idx} "{node}"\n') 
+            
+        f.write("*Arcs\n") # Use *Arcs for directed graph
+        for src, tgt, w, orig_flag in tqdm(edges, desc="Writing arcs", total=len(edges)):
+            # The flag is always True (or 'O') in this directed version,
+            # but we can keep the structure for consistency if desired, or simplify.
+            # For a purely directed network, the flag might be less critical than in the sym version.
+            # Let's keep it as 'O' to denote these are original definition links.
+            flag_char = "O" # Since all edges are original directed links now
+            
+            # Ensure src and tgt are in node_to_index (should be, as they were added to nodes set)
+            if src not in node_to_index or tgt not in node_to_index:
+                print(f"Warning: Skipping edge with unknown node: {src} -> {tgt}")
+                continue
+            
+            f.write(f"{node_to_index[src]} {node_to_index[tgt]} {w:.6f} {flag_char}\n")
+
+def main():
+    input_file = "extracted_definitions.txt"
+    output_file = "wiktionary_directed.net" # New output file name
+
+    if not os.path.exists(input_file):
+        print(f"Input file '{input_file}' not found!")
+        return
+    
+    print(f"Reading definitions from '{input_file}'...")
+    definitions = read_definitions(input_file)
+    print(f"Read definitions for {len(definitions)} head words.")
+    
+    print("Building DIRECTED network...")
+    nodes, directed_edges = build_directed_network(definitions)
+    print(f"DIRECTED network will have {len(nodes)} nodes and {len(directed_edges)} directed edges.")
+    
+    # assign_indices should be called after all nodes are collected
+    node_to_index = assign_indices(nodes) 
+    
+    print(f"Writing DIRECTED Pajek network file to '{output_file}'...")
+    # Pass 'directed_edges' directly to write_pajek_file
+    write_pajek_file(node_to_index, directed_edges, output_file)
+    print(f"DIRECTED network file written to '{output_file}'.")
+
+if __name__ == "__main__":
+    main()

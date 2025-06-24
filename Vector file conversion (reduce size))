@@ -1,0 +1,38 @@
+[w007104@login2 ~]$ cat vec_convert_sym.slurm
+#!/bin/bash
+#SBATCH -J vec_convert_sym
+#SBATCH -o vec_convert_sym.out
+#SBATCH -e vec_convert_sym.err
+#SBATCH -t 01:00:00
+#SBATCH --mem=8G
+module purge
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+python3 - << 'PY'
+import numpy as np, tqdm, os, mmap, pathlib
+
+TXT = "semantic_vectors_sym.txt"          # input
+NPY = "semantic_vectors_sym_f32.npy"      # output  (≈¼ the size)
+
+# ── discover shape ─────────────────────────────────────────
+with open(TXT, 'rb') as fh:
+    nrows = sum(chunk.count(b'\n') for chunk in iter(lambda: fh.read(1<<20), b''))
+with open(TXT, 'r') as fh:
+    first = next(l for l in fh if l.strip())
+veclen = len(first.split())
+print(f"{nrows:,} rows  ×  {veclen} dims")
+
+# ── create mem-mapped raw buffer ───────────────────────────
+raw = np.memmap("tmp.raw", dtype=np.float32, mode='w+', shape=(nrows, veclen))
+with open(TXT, 'r') as fh, tqdm.tqdm(total=nrows, unit='vec') as bar:
+    for i, line in enumerate(fh):
+        if line.strip():
+            raw[i] = np.fromstring(line, sep=' ', dtype=np.float32)
+            bar.update()
+raw.flush()
+
+# ── wrap with .npy header and clean up ─────────────────────
+np.save(NPY, np.asarray(raw))
+os.remove("tmp.raw")
+print("saved", NPY, f"({os.path.getsize(NPY)/1024/1024:.1f} MB, float32)")
+PY

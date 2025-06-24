@@ -1,0 +1,704 @@
+[w007104@login2 ~]$ cat od_aggregate_array.slurm
+#!/bin/bash
+#SBATCH --job-name=od_aggregate
+#SBATCH --output=od_aggregate_%A_%a.out
+#SBATCH --error=od_aggregate_%A_%a.err
+#SBATCH --array=1-10
+#SBATCH --time=100:00:00
+#SBATCH --mem=24G              # raised from 8G to 32G
+#SBATCH --cpus-per-task=16
+
+module purge
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+python3 -u run_od_aggregate_full.py \
+    --job_index ${SLURM_ARRAY_TASK_ID} \
+    --total_pairs_per_chunk 200000 \
+    --log_file od_job_${SLURM_ARRAY_TASK_ID}.log
+[w007104@login2 ~]$ cat run_od_aggregate_full.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Apr 24 10:46:47 2025
+
+@author: pablo
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+run_od_aggregate_full.py
+
+1) Canary: full GD/WD/SD on (money,business) only for chunk 1, dump detailed canary_sd_money_business.txt
+2) --generate_chunks: build 2M fixed↔random pairs split into 10 .pkl chunks
+3) --job_index N: process chunk N in parallel,
+   computing SN/SP SD sums, direct pair SD & cosine, writing summaries.
+"""
+
+import os
+import sys
+import argparse
+import pickle
+import logging
+import time
+import random
+import heapq
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+import numpy as np
+
+# ------------------------------------------------------------------------------
+# Module‐level globals (shared via fork)
+# ------------------------------------------------------------------------------
+ALL_VECTORS = None
+ALL_NORMS   = None
+SETS_DICT   = None
+MAPPING     = None
+REVMAP      = None
+ARCS        = None
+GRAPH       = None
+
+# ------------------------------------------------------------------------------
+# I/O helpers & data loaders
+# ------------------------------------------------------------------------------
+def read_local_definitions(fp):
+    """
+    Reads extracted_definitions.txt (head: token1 token2...).
+    Returns dict {head.lower(): [token1.lower(), token2.lower(), ...]}.
+    **Correction applied here: Tokens are now lowercased.**
+    """
+    d = {}
+    with open(fp, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if ":" not in line:
+                continue
+            head, rest = line.split(":", 1)
+            # Apply .lower() to the definition part before splitting
+            toks = rest.strip().lower().split()
+            if toks:
+                # Key (head) is already lowercased from previous step
+                d[head.strip().lower()] = toks
+    return d
+
+
+def load_all_semantic_vectors_and_norms(fname):
+    """
+    Memory-map the binary .npy file (float32) so every forked worker
+    shares the same physical pages.  Returns (vecs, norms).
+    """
+    vecs = np.load(fname, mmap_mode='r')          # mem-mapped, shape (N,D)
+    norms = np.linalg.norm(vecs, axis=1).astype(np.float32)
+    return vecs, norms
+
+
+def load_node_mapping(netfile):
+    m = {}
+    with open(netfile, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip().lower().startswith("*vertices"):
+                break
+        for line in f:
+            if line.startswith("*"):
+                break
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                idx = int(parts[0]) - 1
+                word = parts[1].strip().strip('"')
+                m[idx] = word
+    return m
+
+def load_arcs(netfile):
+    arcs = {}
+    in_e = False
+    with open(netfile, "r", encoding="utf-8") as f:
+        for l in f:
+            tl = l.strip().lower()
+            if tl.startswith("*arcs") or tl.startswith("*edges"):
+                in_e = True
+                continue
+            if not in_e:
+                continue
+            parts = l.strip().split()
+            if len(parts) >= 4:
+                src = int(parts[0]) - 1
+                tgt = int(parts[1]) - 1
+                flg = parts[3]
+                arcs.setdefault(src, []).append((tgt, flg))
+    return arcs
+
+def load_graph(netfile):
+    graph = {}
+    in_e = False
+    with open(netfile, "r", encoding="utf-8") as f:
+        for l in f:
+            tl = l.strip().lower()
+            if tl.startswith("*arcs") or tl.startswith("*edges"):
+                in_e = True
+                continue
+            if not in_e:
+                continue
+            parts = l.strip().split()
+            if len(parts) >= 4:
+                src = int(parts[0]) - 1
+                tgt = int(parts[1]) - 1
+                try:
+                    w = float(parts[2])
+                except:
+                    w = 0.0
+                flg = parts[3]
+                graph.setdefault(src, []).append((tgt, w, flg))
+    return graph
+
+def load_everything():
+    """Load big data into module globals exactly once."""
+    global ALL_VECTORS, ALL_NORMS, SETS_DICT, MAPPING, REVMAP, ARCS, GRAPH
+    t0 = time.time()
+    logging.info("=== Beginning data load ===")
+    ALL_VECTORS, ALL_NORMS = load_all_semantic_vectors_and_norms("semantic_vectors_sym_f32.npy")
+    SETS_DICT = read_local_definitions("extracted_definitions.txt") # Now uses corrected version
+    logging.info(f"  → loaded {len(SETS_DICT)} definitions")
+    MAPPING = load_node_mapping("wiktionary_sym.net")
+    REVMAP  = {w.lower(): i for i, w in MAPPING.items()}
+    logging.info(f"  → loaded {len(MAPPING)} graph nodes")
+    ARCS  = load_arcs("wiktionary_sym.net")
+    GRAPH = load_graph("wiktionary_sym.net")
+    logging.info(f"  → loaded arcs for {len(ARCS)} sources / edges for {len(GRAPH)} sources")
+    logging.info(f"=== Data load complete in {time.time() - t0:.1f}s ===")
+
+# ------------------------------------------------------------------------------
+# Canary (only for chunk 1)
+# ------------------------------------------------------------------------------
+def write_canary():
+    logging.info(">>> Canary: reading definitions (will use corrected lowercase token version)")
+    # SETS_DICT is already loaded globally with the correction
+    logging.info(">>> Canary: running full OD on (money, business)")
+    res = run_od_full("money", "business", SETS_DICT)
+    logging.info(">>> Canary: writing canary_sd_money_business.txt")
+    with open("canary_sd_money_business.txt", "w", encoding="utf-8") as f:
+        f.write("Canary OD for (money, business)\n")
+        f.write("================================\n\n")
+        f.write("Great Differentiation (GD) Output:\n")
+        f.write(res["gd_output"] + "\n")
+        f.write(f"GD max level: {res['gd_max_level']}\n\n")
+        f.write("Weak Differentiation (WD) Output:\n")
+        f.write(res["wd_output"] + "\n")
+        f.write(f"WD total points: {res['wd_total_points']}\n\n")
+        f.write("Strong Differentiation (SD) Output:\n")
+        f.write(res["sd_output"] + "\n")
+        f.write(f"SD total points: {res['sd_total_points']}\n")
+
+# ------------------------------------------------------------------------------
+# Navigation routines (unchanged from previous version)
+# ------------------------------------------------------------------------------
+def dijkstra(graph, source, target):
+    dist = {n: float("inf") for n in graph}
+    for n in graph:
+        for nbr,_,_ in graph[n]:
+            dist.setdefault(nbr, float("inf"))
+    dist[source] = 0.0
+    preds, visited = {}, set()
+    heap = [(0.0, source)]
+    while heap:
+        cd, u = heapq.heappop(heap)
+        if u in visited: continue
+        visited.add(u)
+        if u == target: break
+        for v, w, flg in graph.get(u, []):
+            if v in visited: continue
+            nd = cd + w
+            if nd < dist[v]:
+                dist[v], preds[v] = nd, (u, flg)
+                heapq.heappush(heap, (nd, v))
+    return dist, preds
+
+def reconstruct_path(preds, source, target):
+    path, flags = [], []
+    cur = target
+    while cur != source:
+        if cur not in preds: return [], []
+        p, flg = preds[cur]
+        path.append(cur); flags.append(flg)
+        cur = p
+    path.append(source); path.reverse(); flags.reverse()
+    return path, flags
+
+def semantic_navigation_local(vectors, norms, arcs, src, tgt, max_steps=10):
+    """
+    Performs semantic navigation with a smart tie-breaking rule.
+    If the target is among the set of 'best' next-step candidates,
+    it is chosen preferentially.
+    """
+    tv, tn = vectors[tgt], norms[tgt]
+    if tn == 0.0:
+        return [], [], []
+
+    path, cosh, fgs = [src], [], []
+    cur = src
+    for _ in range(max_steps):
+        if cur == tgt:
+            break
+
+        nbrs = arcs.get(cur, [])
+        valid = [n for n, flg in nbrs
+                 if n not in path and norms[n] > 0.0] 
+
+        if not valid:
+            break
+        
+        # This part is now a multi-step process to handle ties
+        # 1. Calculate similarities
+        nbr_vecs  = np.vstack([vectors[n] for n in valid])
+        nbr_norms = np.array([norms[n] for n in valid])
+        sims = nbr_vecs.dot(tv) / (nbr_norms * tn + 1e-10)
+
+        # 2. Find the maximum similarity score
+        max_sim = np.max(sims)
+
+        # 3. Identify all candidates that achieve this max score (within a tolerance)
+        best_indices = np.where(sims >= max_sim - 1e-9)[0]
+        best_candidate_ids = [valid[i] for i in best_indices]
+
+        # 4. <<<<<<<<<<<<< THE "STARBUCKS PRINCIPLE" FIX >>>>>>>>>>>>>
+        # Apply the intelligent tie-breaking rule.
+        if tgt in best_candidate_ids:
+            # If the target itself is one of the best options, choose it.
+            best_n = tgt
+        else:
+            # Otherwise, fall back to the original deterministic behavior:
+            # pick the first one from the list of best candidates.
+            best_n = best_candidate_ids[0]
+        # <<<<<<<<<<<<<<<<<<<<<< END OF FIX >>>>>>>>>>>>>>>>>>>>>>>>>
+
+        # The rest of the loop proceeds as before
+        best_sim = float(np.max(sims)) # The similarity score is still the max
+        best_flg = next(flg for n, flg in nbrs if n == best_n)
+
+        cosh.append(best_sim)
+        fgs.append(best_flg)
+        path.append(best_n)
+        cur = best_n
+
+    return path, cosh, fgs
+
+
+def run_combined_navigation(origin, target, vectors, norms):
+    src = REVMAP.get(origin.lower())
+    tgt = REVMAP.get(target.lower())
+    if src is None or tgt is None:
+        return None
+    spath, _, _ = semantic_navigation_local(vectors, norms, ARCS, src, tgt, max_steps=20)
+    dists, preds = dijkstra(GRAPH, src, tgt)
+    dpath, _     = reconstruct_path(preds, src, tgt)
+    to_word = lambda lst: [MAPPING.get(i, "unknown") for i in lst]
+    return {
+        "semantic_path": to_word(spath),
+        "shortest_path": to_word(dpath),
+        "source":        MAPPING[src]
+    }
+
+# ------------------------------------------------------------------------------
+# OD routines (unchanged from previous version)
+# ------------------------------------------------------------------------------
+def process_great_differentiation(a, b, sets_dict, max_level=10000):
+    repeated, uncancel, opened = set(), set(), set()
+    level, steps = 0, []
+    for e in (a, b):
+        if e in repeated or e in uncancel:
+            repeated.add(e); uncancel.discard(e)
+        else:
+            uncancel.add(e)
+    steps.append(f"Level {level}:\n Uncanceled: {uncancel}\n Repeated: {repeated}\n")
+    to_open = {a, b}; level = 1
+    while level <= max_level:
+        curr_unc, new_it = set(), set()
+        for sw in to_open:
+            opened.add(sw)
+            # Use lowercase lookups because SETS_DICT keys and tokens are now lowercase
+            for w in sets_dict.get(sw, []): # sw is already lowercase
+                if w in repeated or w in uncancel: # w is already lowercase
+                    repeated.add(w); uncancel.discard(w)
+                elif w in new_it:
+                    repeated.add(w); curr_unc.discard(w)
+                else:
+                    new_it.add(w); curr_unc.add(w)
+        uncancel |= curr_unc
+        steps.append(f"Level {level}:\n New: {new_it}\n Uncanceled: {uncancel}\n Repeated: {repeated}\n")
+        if not new_it:
+            steps.append(f"Termination at Level {level} (no new elements)\n")
+            break
+        to_open, level = new_it, level + 1
+    return level, "\n".join(steps)
+
+def check_any_U_empty(U):
+    return [(lvl, s) for (lvl, s) in U if not U[(lvl, s)]]
+
+def calculate_total_points(R):
+    tot = 0
+    for (lvl, side), elems in R.items():
+        for cnt in elems.values():
+            tot += lvl * cnt
+    return tot
+
+def log_current_state(so, U, R, lvl, sides):
+    if lvl not in so: so[lvl] = {}
+    for s in sides:
+        so[lvl][(lvl, s)] = (list(U[(lvl, s)].keys()), dict(R[(lvl, s)]))
+
+def check_repetition_WD(E, U, R, lvl, so):
+    ge = Counter()
+    for l in range(lvl + 1):
+        for s in (1, 2):
+            ge += E.get((l, s), Counter())
+    for l in range(lvl + 1):
+        for s in (1, 2):
+            for u in list(U[(l, s)].keys()): # u is already lowercase
+                if ge[u] > 1:
+                    cnt = U[(l, s)].pop(u)
+                    R[(l, s)][u] += cnt
+                    log_current_state(so, U, R, l, [s])
+
+def check_repetition_SD(E, U, R, lvl, so):
+    opp1, opp2 = Counter(), Counter()
+    for l in range(lvl + 1):
+        opp1 += E.get((l, 2), Counter())
+        opp2 += E.get((l, 1), Counter())
+    for l in range(lvl + 1):
+        for s in (1, 2):
+            for u in list(U[(l, s)].keys()): # u is already lowercase
+                if (s == 1 and opp1[u] > 0) or (s == 2 and opp2[u] > 0):
+                    cnt = U[(l, s)].pop(u)
+                    R[(l, s)][u] += cnt
+                    log_current_state(so, U, R, l, [s])
+
+def save_outputs(so):
+    out = []
+    levels = sorted(k for k in so if isinstance(k, int))
+    for lvl in levels:
+        out.append(f"Level {lvl}:")
+        for side in (1, 2):
+            Ue, Re = so[lvl][(lvl, side)]
+            out.append(f"Side {side} - U_{lvl}_{side}: {Ue}, R_{lvl}_{side}: {Re}")
+        out.append("")
+    if "Termination" in so: out.append(so["Termination"])
+    if "Total Points" in so: out.append(so["Total Points"])
+    return "\n".join(out)
+
+def process_optimized_weak_differentiation_with_paths(a, b, sets_dict, max_level=10000):
+    E, U, R, so = {}, {}, {}, {}
+    sides = (1, 2)
+    E[(0, 1)], E[(0, 2)] = Counter([a]), Counter([b]) # a, b are lowercase
+    for s in sides:
+        U[(0, s)] = E[(0, s)].copy(); R[(0, s)] = Counter()
+    log_current_state(so, U, R, 0, sides); check_repetition_WD(E, U, R, 0, so)
+    if check_any_U_empty(U):
+        so["Termination"] = "Terminated at Level 0"
+        so["Total Points"] = f"Total points: {calculate_total_points(R)}"
+        return calculate_total_points(R), save_outputs(so), None
+    for lvl in range(1, max_level + 1):
+        for s in sides:
+            E[(lvl, s)] = Counter()
+            for elem, c in E[(lvl - 1, s)].items(): # elem is lowercase
+                for e in sets_dict.get(elem, [elem]): # e is lowercase from corrected sets_dict
+                    E[(lvl, s)][e] += c
+        for s in sides:
+            U[(lvl, s)] = E[(lvl, s)].copy(); R[(lvl, s)] = Counter()
+        check_repetition_WD(E, U, R, lvl, so); log_current_state(so, U, R, lvl, sides)
+        if check_any_U_empty(U):
+            so["Termination"] = f"Terminated at Level {lvl}"
+            so["Total Points"] = f"Total points: {calculate_total_points(R)}"
+            return calculate_total_points(R), save_outputs(so), None
+    tp = calculate_total_points(R)
+    so["Termination"], so["Total Points"] = f"Reached max level {max_level}", f"Total points: {tp}"
+    return tp, save_outputs(so), None
+
+def process_optimized_strong_differentiation_with_paths(a, b, sets_dict, max_level=10000):
+    E, U, R, so = {}, {}, {}, {}
+    sides = (1, 2)
+    E[(0, 1)], E[(0, 2)] = Counter([a]), Counter([b]) # a, b are lowercase
+    for s in sides:
+        U[(0, s)] = E[(0, s)].copy(); R[(0, s)] = Counter()
+    log_current_state(so, U, R, 0, sides); check_repetition_SD(E, U, R, 0, so)
+    if check_any_U_empty(U):
+        so["Termination"] = "Terminated at Level 0"
+        so["Total Points"] = f"Total points: {calculate_total_points(R)}"
+        return calculate_total_points(R), save_outputs(so), None
+    for lvl in range(1, max_level + 1):
+        for s in sides:
+            E[(lvl, s)] = Counter()
+            for elem, c in E[(lvl - 1, s)].items(): # elem is lowercase
+                for e in sets_dict.get(elem, [elem]): # e is lowercase from corrected sets_dict
+                    E[(lvl, s)][e] += c
+        for s in sides:
+            U[(lvl, s)] = E[(lvl, s)].copy(); R[(lvl, s)] = Counter()
+        check_repetition_SD(E, U, R, lvl, so); log_current_state(so, U, R, lvl, sides)
+        if check_any_U_empty(U):
+            so["Termination"] = f"Terminated at Level {lvl}"
+            so["Total Points"] = f"Total points: {calculate_total_points(R)}"
+            return calculate_total_points(R), save_outputs(so), None
+    tp = calculate_total_points(R)
+    so["Termination"], so["Total Points"] = f"Reached max level {max_level}", f"Total points: {tp}"
+    return tp, save_outputs(so), None
+
+def run_od_full(origin, candidate, sets_dict):
+    # origin, candidate are already lowercase from worker
+    gd_max, gd_out    = process_great_differentiation(origin, candidate, sets_dict)
+    wd_pts, wd_out, _ = process_optimized_weak_differentiation_with_paths(origin, candidate, sets_dict, gd_max)
+    sd_pts, sd_out, _ = process_optimized_strong_differentiation_with_paths(origin, candidate, sets_dict, gd_max)
+    return {
+        "gd_max_level":    gd_max,
+        "gd_output":       gd_out,
+        "wd_total_points": wd_pts,
+        "wd_output":       wd_out,
+        "sd_total_points": sd_pts,
+        "sd_output":       sd_out
+    }
+
+# ----------------------------------------------------------------------
+# Worker: Simplified version for comprehensive analysis
+# ----------------------------------------------------------------------
+def worker(pair):
+    """
+    Performs all calculations for a pair and returns a rich dictionary.
+    Uses the original, simple invalidation logic (path success only).
+    """
+    origin_raw, target_raw = pair
+    origin_lc = origin_raw.lower()
+    target_lc = target_raw.lower()
+
+    # --- Pathfinding ---
+    nav = run_combined_navigation(origin_lc, target_lc, ALL_VECTORS, ALL_NORMS)
+    if nav is None:
+        return {"invalid": True, "reason": "MAPPING_FAILURE"}
+
+    spath = nav["semantic_path"]
+    dpath = nav["shortest_path"]
+
+    # --- Validation: Both paths must reach target and be within 20 hops ---
+    def reached(p): return p and p[-1].lower() == target_lc
+    def ok_len(p): return (len(p) - 1) <= 20
+
+    if not (reached(spath) and reached(dpath) and ok_len(spath) and ok_len(dpath)):
+        return {"invalid": True, "reason": "PATH_FAILURE"}
+
+    # --- SD Sums (simple calculation) ---
+    total_sem_sd = sum(run_od_full(origin_lc, w.lower(), SETS_DICT)["sd_total_points"]
+                       for w in spath[1:])
+    total_sp_sd = sum(run_od_full(origin_lc, w.lower(), SETS_DICT)["sd_total_points"]
+                      for w in dpath[1:])
+
+    # --- Calculate all metrics for the report ---
+    h_sn = len(spath) - 1
+    h_sp = len(dpath) - 1
+    if h_sn == 0 or h_sp == 0:
+        return {"invalid": True, "reason": "ZERO_HOP_PATH"}
+
+    avg_sem_sd = total_sem_sd / h_sn
+    avg_sp_sd = total_sp_sd / h_sp
+
+    return {
+        "invalid": False,
+        "total_sem_sd": total_sem_sd,
+        "total_sp_sd": total_sp_sd,
+        "avg_sem_sd": avg_sem_sd,
+        "avg_sp_sd": avg_sp_sd,
+        "sem_len": h_sn,
+        "sp_len": h_sp,
+    }
+
+
+
+def load_candidates_from_definitions(fp):
+    L = []
+    with open(fp, "r", encoding="utf-8") as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            head = line.split(":", 1)[0].strip().lower()
+            if head:
+                L.append(head)
+    return L
+
+# ----------------------------------------------------------------------
+# process_chunk: MapReduce-ready version
+# ----------------------------------------------------------------------
+def process_chunk(idx, pairs, out_fn, logger):
+    """
+    Processes the chunk, writes a per-chunk summary for monitoring,
+    and saves the detailed results for final aggregation.
+    """
+    total = len(pairs)
+    logger.info(f"[Job {idx}] start processing {total} pairs")
+
+    # Use max_workers=16 to match your SLURM --cpus-per-task
+    with ProcessPoolExecutor(max_workers=16) as exe:
+        results = list(tqdm(exe.map(worker, pairs, chunksize=200),
+                            total=total, desc=f"Job {idx}", ncols=80))
+
+    # --- Collect valid results and invalid reasons ---
+    invalid_counts = Counter(r.get("reason", "UNKNOWN") for r in results if r["invalid"])
+    valid_results = [r for r in results if not r["invalid"]]
+    
+    # --- Perform per-chunk summary analysis (for monitoring) ---
+    stats = {
+        'total_sd': {'less': {'count': 0}, 'equal': {'count': 0}, 'more': {'count': 0}},
+        'avg_sd': {'less': {'count': 0, 'sem_path_lens': [], 'sp_path_lens': []}, 'equal': {'count': 0, 'sem_path_lens': [], 'sp_path_lens': []}, 'more': {'count': 0, 'sem_path_lens': [], 'sp_path_lens': []}},
+        'same_length': {'less': {'count': 0, 'path_lens': []}, 'equal': {'count': 0, 'path_lens': []}, 'more': {'count': 0, 'path_lens': []}}
+    }
+    for r in valid_results:
+        if r['total_sem_sd'] < r['total_sp_sd']:   stats['total_sd']['less']['count'] += 1
+        elif r['total_sem_sd'] > r['total_sp_sd']: stats['total_sd']['more']['count'] += 1
+        else:                                      stats['total_sd']['equal']['count'] += 1
+        if r['avg_sem_sd'] < r['avg_sp_sd']: cat = 'less'
+        elif r['avg_sem_sd'] > r['avg_sp_sd']: cat = 'more'
+        else: cat = 'equal'
+        stats['avg_sd'][cat]['count'] += 1
+        stats['avg_sd'][cat]['sem_path_lens'].append(r['sem_len'])
+        stats['avg_sd'][cat]['sp_path_lens'].append(r['sp_len'])
+        if r['sem_len'] == r['sp_len']:
+            if r['avg_sem_sd'] < r['avg_sp_sd']: cat_sl = 'less'
+            elif r['avg_sem_sd'] > r['avg_sp_sd']: cat_sl = 'more'
+            else: cat_sl = 'equal'
+            stats['same_length'][cat_sl]['count'] += 1
+            stats['same_length'][cat_sl]['path_lens'].append(r['sem_len'])
+
+    def _calculate_averages(d):
+        for category in d.values():
+            if category.get('sem_path_lens'): category['avg_sem_len'] = np.mean(category['sem_path_lens']) if category['sem_path_lens'] else 0
+            if category.get('sp_path_lens'): category['avg_sp_len'] = np.mean(category['sp_path_lens']) if category['sp_path_lens'] else 0
+            if category.get('path_lens'): category['avg_path_len'] = np.mean(category['path_lens']) if category['path_lens'] else 0
+    _calculate_averages(stats['avg_sd'])
+    _calculate_averages(stats['same_length'])
+
+    # --- Write the per-chunk summary report (for monitoring) ---
+    valid_count = len(valid_results)
+    logger.info(f"[Job {idx}] SUMMARY Total={total}, Valid={valid_count}, Invalid={sum(invalid_counts.values())}")
+    logger.info(f"[Job {idx}] Invalid counts by reason: {dict(invalid_counts)}")
+
+    with open(out_fn, "w", encoding="utf-8") as f:
+        f.write(f"======= PER-CHUNK Summary Report for Job {idx} =======\n\n")
+        f.write(f"Total pairs processed: {total}\n")
+        f.write(f"Valid pairs for analysis: {valid_count}\n")
+        f.write("Invalid pairs breakdown:\n")
+        for reason, count in invalid_counts.items():
+            f.write(f"  - {reason}: {count}\n")
+        f.write("\n" + "="*50 + "\n\n")
+        # Write the 3 analyses...
+        f.write("ANALYSIS 1: Comparison of TOTAL Cumulative SD\n" + "-"*45 + "\n")
+        f.write(f"SN Total SD < SP Total SD: {stats['total_sd']['less']['count']}\n")
+        f.write(f"SN Total SD > SP Total SD: {stats['total_sd']['more']['count']}\n")
+        f.write(f"SN Total SD = SP Total SD: {stats['total_sd']['equal']['count']}\n\n" + "="*50 + "\n\n")
+        f.write("ANALYSIS 2: Comparison of AVERAGE SD per Hop (All Valid Pairs)\n" + "-"*62 + "\n")
+        for cat in ['less', 'more', 'equal']:
+            s = stats['avg_sd'][cat]
+            prefix = f"SN Avg SD {'<' if cat == 'less' else '>' if cat == 'more' else '='} SP Avg SD"
+            avg_sn = f"{s.get('avg_sem_len', 0):.2f}"
+            avg_sp = f"{s.get('avg_sp_len', 0):.2f}"
+            f.write(f"{prefix}: {s['count']:<8} (Avg SN len: {avg_sn}, Avg SP len: {avg_sp})\n")
+        f.write("\n" + "="*50 + "\n\n")
+        f.write("ANALYSIS 3: Comparison of AVERAGE SD per Hop (Same-Length Paths ONLY)\n" + "-"*70 + "\n")
+        for cat in ['less', 'more', 'equal']:
+            s = stats['same_length'][cat]
+            prefix = f"SN Avg SD {'<' if cat == 'less' else '>' if cat == 'more' else '='} SP Avg SD"
+            avg_len = f"{s.get('avg_path_len', 0):.2f}"
+            f.write(f"{prefix}: {s['count']:<8} (Avg Path len: {avg_len})\n")
+
+    logger.info(f"[Job {idx}] wrote per-chunk summary report to {out_fn}")
+
+    # --- Save the detailed results for final aggregation ---
+    detailed_out_fn = f"detailed_results_chunk_{idx}.pkl"
+    with open(detailed_out_fn, "wb") as f:
+        pickle.dump(valid_results, f)
+    logger.info(f"[Job {idx}] SAVED {len(valid_results)} DETAILED RESULTS to {detailed_out_fn}")
+
+# ------------------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="OD aggregate full with chunking")
+    parser.add_argument("--generate_chunks", action="store_true")
+    parser.add_argument("--fixed",        type=str)
+    parser.add_argument("--random_start", type=int)
+    parser.add_argument("--random_end",   type=int)
+    parser.add_argument("--num_random",   type=int)
+    parser.add_argument("--pairs_dir",    type=str, default="pairs_chunks")
+    parser.add_argument("--total_pairs_per_chunk", type=int, default=200000)
+    parser.add_argument("--job_index",    type=int)
+    parser.add_argument("--log_file",     type=str, default="od_job.log")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        filename=args.log_file,
+        filemode="w",
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logger = logging.getLogger()
+    logger.info(f"=== run_od_aggregate_full start args={args} ===")
+
+    # Load all data once before canary or processing
+    load_everything()
+
+    # Canary: only in chunk 1, not in generate_chunks
+    if not args.generate_chunks and args.job_index == 1:
+        logger.info("=== Canary test begin ===")
+        write_canary()
+        logger.info("=== Canary test done ===")
+
+    # generate_chunks branch
+    os.makedirs(args.pairs_dir, exist_ok=True)
+    if args.generate_chunks:
+        if not (args.fixed and args.random_start and args.random_end and args.num_random):
+            logger.error("Missing generate_chunks args")
+            sys.exit(1)
+        fixed     = [w.strip() for w in args.fixed.split(",") if w.strip()]
+        # Use already loaded SETS_DICT keys for checking definitions exist
+        all_cands = load_candidates_from_definitions("extracted_definitions.txt") # Need original list for slicing
+        sub       = all_cands[args.random_start - 1 : args.random_end]
+        if len(sub) < args.num_random:
+            logger.error("Not enough words in range")
+            sys.exit(1)
+        rand_words  = random.sample(sub, args.num_random)
+        total_pairs = len(fixed) * len(rand_words) * 2
+        logger.info(f"Generating {total_pairs} fixed↔random pairs")
+        pairs = []
+        for f in fixed:
+            for r in rand_words:
+                if f != r: # Use original casing for pairs file
+                    pairs.append((f, r))
+                    pairs.append((r, f))
+        random.shuffle(pairs)
+        nchunks = total_pairs // args.total_pairs_per_chunk
+        for i in range(1, nchunks + 1):
+            chunk = pairs[(i - 1) * args.total_pairs_per_chunk : i * args.total_pairs_per_chunk]
+            fn    = os.path.join(args.pairs_dir, f"od_pairs_chunk_{i}.pkl")
+            with open(fn, "wb") as cf:
+                pickle.dump(chunk, cf)
+            logger.info(f"Wrote chunk {i} ({len(chunk)}) → {fn}")
+        logger.info("All chunks generated; exiting.")
+        sys.exit(0)
+
+    # process chunk
+    if args.job_index is None:
+        logger.error("Must specify --job_index")
+        sys.exit(1)
+    chunk_fn = os.path.join(args.pairs_dir, f"od_pairs_chunk_{args.job_index}.pkl")
+    if not os.path.exists(chunk_fn):
+        logger.error(f"Missing chunk file {chunk_fn}")
+        sys.exit(1)
+
+    logger.info(f"Loading chunk file {chunk_fn}")
+    with open(chunk_fn, "rb") as f:
+        chunk_pairs_original_case = pickle.load(f) # Load pairs with original casing
+    logger.info(f"Loaded {len(chunk_pairs_original_case)} pairs")
+
+    results_out = f"results_chunk_{args.job_index}.txt"
+    # Pass the loaded pairs (with original case) to process_chunk
+    process_chunk(args.job_index, chunk_pairs_original_case, results_out, logger)
+
+    logger.info("=== run_od_aggregate_full finished ===")
+
+if __name__ == "__main__":
+    main()

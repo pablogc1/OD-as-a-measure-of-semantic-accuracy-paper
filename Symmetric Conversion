@@ -1,0 +1,147 @@
+[w007104@login2 ~]$ cat convert_definitions_to_network_sym.slurm
+#!/bin/bash
+#SBATCH --job-name=conv_net_sym
+#SBATCH --output=conv_net_sym_%j.out
+#SBATCH --error=conv_net_sym_%j.err
+#SBATCH --time=10:30:00
+#SBATCH --mem=2G
+#SBATCH --cpus-per-task=16
+
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+pip install --upgrade --user pip
+
+python3 convert_definitions_to_network_sym.py
+
+[w007104@login2 ~]$ cat convert_definitions_to_network_sym.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Converts an extracted definitions file into a symmetrized Pajek network file with edge flags.
+
+Input:
+  - The input file (extracted_definitions.txt) should have lines in the format:
+      word: token1 token2 token3 ...
+  Every word (both head entries and tokens) becomes a node.
+
+Process:
+  - For each definition, a directed edge is created from the head word to each token,
+    with weight = 1/(number of tokens in that definition), and flagged as "O" (original).
+  - Then, to symmetrize the network, for every edge (A → B) we add the reverse edge (B → A)
+    if it does not already exist. The reverse edge is assigned the same weight and flagged as "S".
+    
+Output:
+  - The resulting undirected (symmetrized) network is written in Pajek (.net) format to wiktionary_sym.net.
+    Each arc line includes an extra field indicating the flag ("O" for original, "S" for symmetrized).
+"""
+
+import os
+from tqdm import tqdm
+
+def read_definitions(file_path):
+    """
+    Reads the definitions file and returns a dictionary mapping each head word
+    to its list of tokens. Assumes each line is in the format "word: token1 token2 token3 ...".
+    A progress bar is displayed while processing the file.
+    """
+    definitions = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    for line in tqdm(lines, desc="Reading definitions"):
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        head, def_text = line.split(':', 1)
+        head = head.strip()
+        tokens = def_text.strip().split()
+        if tokens:
+            definitions[head] = tokens
+    return definitions
+
+def build_directed_network(definitions):
+    """
+    Builds a directed network from the definitions.
+    Returns a set of nodes and a list of directed edges.
+    Each edge is a tuple (head, token, weight, flag), where flag is True (original).
+    A progress bar is shown while iterating through definitions.
+    """
+    nodes = set()
+    edges = []
+    for head, tokens in tqdm(definitions.items(), desc="Building directed network", total=len(definitions)):
+        nodes.add(head)
+        weight = 1.0 / len(tokens)
+        for token in tokens:
+            nodes.add(token)
+            edges.append((head, token, weight, True))  # Original edge flagged as True.
+    return nodes, edges
+
+def symmetrize_edges(edges):
+    """
+    Given a list of directed edges (source, target, weight, original_flag),
+    returns a new list of edges that is symmetrized.
+    For each original edge (A → B), if the reverse edge (B → A) does not exist,
+    add it with the same weight and flag it as False (symmetrized).
+    A progress bar is displayed over the edge list.
+    """
+    edge_dict = {}
+    for src, tgt, w, orig in tqdm(edges, desc="Recording original edges", total=len(edges)):
+        edge_dict[(src, tgt)] = (w, orig)
+    for (src, tgt), (w, orig) in tqdm(list(edge_dict.items()), desc="Adding reverse edges", total=len(edge_dict)):
+        if (tgt, src) not in edge_dict:
+            edge_dict[(tgt, src)] = (w, False)
+    sym_edges = [(src, tgt, w, orig) for (src, tgt), (w, orig) in edge_dict.items()]
+    return sym_edges
+
+def assign_indices(nodes):
+    """
+    Assigns a unique index (starting at 1) to each node.
+    Returns a dictionary mapping node -> index.
+    """
+    sorted_nodes = sorted(nodes)
+    return {node: idx + 1 for idx, node in enumerate(sorted_nodes)}
+
+def write_pajek_file(node_to_index, edges, output_file):
+    """
+    Writes the network to a Pajek (.net) file.
+    The vertices section lists all nodes.
+    The arcs section lists each edge with its weight and an extra flag field:
+      "O" for original edges and "S" for symmetrized edges.
+    A progress bar is displayed while writing edges.
+    """
+    with open(output_file, 'w', encoding='utf-8') as f:
+        num_vertices = len(node_to_index)
+        f.write(f"*Vertices {num_vertices}\n")
+        for node, idx in node_to_index.items():
+            f.write(f'{idx} "{node}"\n')
+        f.write("*Arcs\n")
+        for src, tgt, w, orig in tqdm(edges, desc="Writing arcs", total=len(edges)):
+            flag = "O" if orig else "S"
+            f.write(f"{node_to_index[src]} {node_to_index[tgt]} {w:.6f} {flag}\n")
+
+def main():
+    input_file = "extracted_definitions.txt"  # Input definitions file.
+    output_file = "wiktionary_sym.net"          # Output symmetrized network file.
+    
+    if not os.path.exists(input_file):
+        print(f"Input file '{input_file}' not found!")
+        return
+    
+    print("Reading definitions...")
+    definitions = read_definitions(input_file)
+    print(f"Read definitions for {len(definitions)} head words.")
+    
+    print("Building directed network...")
+    nodes, directed_edges = build_directed_network(definitions)
+    print(f"Network will have {len(nodes)} nodes and {len(directed_edges)} directed edges.")
+    
+    print("Symmetrizing network...")
+    sym_edges = symmetrize_edges(directed_edges)
+    print(f"Symmetrized network has {len(sym_edges)} edges.")
+    
+    node_to_index = assign_indices(nodes)
+    print("Writing symmetrized Pajek network file with edge flags...")
+    write_pajek_file(node_to_index, sym_edges, output_file)
+    print(f"Symmetrized network file written to '{output_file}'.")
+
+if __name__ == "__main__":
+    main()

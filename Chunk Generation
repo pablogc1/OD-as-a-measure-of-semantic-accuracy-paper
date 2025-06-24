@@ -1,0 +1,18 @@
+[w007104@login2 ~]$ cat generate_chunks.slurm
+#!/bin/bash
+#SBATCH --job-name=generate_chunks
+#SBATCH --output=generate_chunks_%j.out
+#SBATCH --error=generate_chunks_%j.err
+#SBATCH --time=00:30:00
+#SBATCH --mem=4G
+#SBATCH --cpus-per-task=4
+
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+python3 -u run_od_aggregate_full.py \
+    --generate_chunks \
+    --fixed "money,business,malaria,hospital,Prometheus,communism,zebra,donkey,pancreas,superhero,mathematics,philosophy,religion,book,writer,computer,kitchen,depression,tariff,plane,chef,constellation,lawyer,Caesar,church,Homo sapiens,Internet,Lyme disease,christmas,Tyrannosaurus Rex,ambition,job,capitalism,Physics,basketball,wizard,woman,womb,yogurt,yolk,word,wound,widow,war,virus,villain,venom,vegan,vaccine,umbrella,tycoon,twin,truce,trophy,tribe,trauma,traitor,tragedy,tradition,toothpick,tomb,tipsy,theater,theory,thanks,television,taxi,synonym,sword,suspense,survival,suicide,stupid,stress,sperm,speculation,spatula,sophisticated,soap,snow,smuggle,sloth,slave,skeptical,simulation,shrine,shampoo,semantics,scam,satisfaction,saint,robot,rhinoceros,republic,ransom,quantum,priest,popcorn,placebo,piano" \
+    --random_start 1830 \
+    --random_end   21112 \
+    --num_random   10000 \
+    --total_pairs_per_chunk 200000

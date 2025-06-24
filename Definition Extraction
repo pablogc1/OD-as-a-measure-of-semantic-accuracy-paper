@@ -1,0 +1,376 @@
+[w007104@login2 ~]$ cat wiktionary_definitions.slurm
+#!/bin/bash
+#SBATCH --job-name=wikidefs
+#SBATCH --output=wikidefs_%j.out
+#SBATCH --error=wikidefs_%j.err
+#SBATCH --time=08:00:00
+#SBATCH --mem=4G
+#SBATCH --cpus-per-task=16
+
+# Load the required Python module.
+module load Python/3.10.8-GCCcore-12.2.0-bare
+
+# Upgrade pip and install required packages.
+pip install --upgrade --user pip
+pip install --user requests beautifulsoup4 tqdm
+
+# Run the parallel definitions extraction script.
+python3 wiktionary_definitions.py
+[w007104@login2 ~]$ cat wiktionary_definitions.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Mar 27 21:31:31 2025
+
+@author: pablo
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Parallel extraction of Wiktionary definitions.
+For each entry in "wiktionary_entries.txt", if the entry is allowed (noun, verb, adjective, or proper noun),
+the script fetches its Wiktionary page and extracts its definition.
+If an italic candidate is found in the cleaned main definition (a signal for plurals, etc.),
+the entry is discarded.
+The process is parallelized using 16 threads and shows a progress bar.
+The final non-empty definitions are saved to "extracted_definitions.txt".
+"""
+
+import os
+import re
+import requests
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+import concurrent.futures
+
+# Caches to avoid duplicate network calls.
+final_form_cache = {}
+allowed_category_cache = {}
+
+# Debug logging is turned off in production.
+DEBUG = False
+
+def debug_log(message):
+    if DEBUG:
+        print(message)
+
+# Mapping for contraction handling.
+# Tokens mapped to None are dropped.
+# MODIFICATION: Emptied the dictionary to disable contraction filtering.
+CONTRACTIONS = {}
+# Original CONTRACTIONS dictionary commented out for reference:
+# CONTRACTIONS = {
+#     "hasnt": "have",
+#     "wouldnt": "would",
+#     "cant": "can",
+#     "havent": "have",
+#     "wont": "will",
+#     "didnt": None,
+#     "dont": None,
+#     "doesnt": None,
+#     "was": None,
+#     "were": None,
+#     "wasnt": None,
+#     "werent": None,
+#     "do": None,
+#     "about": None,
+#     "other": None,
+#     "something": None,
+#     "like": None,
+#     "thing": None,
+#     "use": None,
+#     "give": None,
+#     "take": None,
+#     "make": None,
+#     "what": None,
+#     "come": None,
+#     "find": None,
+#     "can": None,
+#     "how": None,
+#     "have": None,
+#     "would": None,
+#     "will": None,
+#     "not": None,
+# }
+
+
+def extract_main_definition_html(element):
+    """
+    Given an element (usually the <li> within an <ol> holding the definition),
+    return the HTML up to the point where the main definition ends.
+    It checks for markers such as <dl>, <ul>, or the words "synonyms:" or "antonyms:".
+    """
+    html_str = str(element)
+    candidates = []
+    dl_index = html_str.find("<dl")
+    if dl_index != -1:
+        candidates.append(dl_index)
+    ul_index = html_str.find("<ul")
+    if ul_index != -1:
+        candidates.append(ul_index)
+    lower_html = html_str.lower()
+    syn_index = lower_html.find("synonyms:")
+    if syn_index != -1:
+        candidates.append(syn_index)
+    ant_index = lower_html.find("antonyms:")
+    if ant_index != -1:
+        candidates.append(ant_index)
+    if candidates:
+        stop_index = min(candidates)
+        return html_str[:stop_index]
+    else:
+        return html_str
+
+def get_final_form(word):
+    """
+    Fetches the Wiktionary page for a word and attempts to determine its lemma by checking for an italic candidate.
+    If an italic candidate is found (and does not contain a question mark), that candidate is returned.
+    Otherwise, returns the original word.
+    The URL is built using the original word to preserve capitalization.
+    """
+    if word in final_form_cache:
+        return final_form_cache[word]
+
+    url = f"https://simple.wiktionary.org/wiki/{word}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            final_form_cache[word] = word
+            return word
+        soup = BeautifulSoup(response.text, "html.parser")
+        ol = soup.find("ol")
+        if not ol:
+            final_form_cache[word] = word
+            return word
+        li = ol.find("li")
+        element = li if li else ol
+        main_html = extract_main_definition_html(element)
+        cleaned_html_str = re.sub(r'\([^)]*\)', '', main_html)
+        cleaned_soup = BeautifulSoup(cleaned_html_str, "html.parser")
+        plain_text = cleaned_soup.get_text(separator=" ", strip=True)
+        running_length = 0
+        stop_limit = len(plain_text)
+        for elem in cleaned_soup.recursiveChildGenerator():
+            if isinstance(elem, str):
+                running_length += len(elem)
+                if running_length >= stop_limit:
+                    break
+            elif elem.name == "i":
+                if running_length < stop_limit:
+                    candidate = elem.get_text(strip=True)
+                    if "?" in candidate:
+                        continue
+                    final_form_cache[word] = candidate
+                    return candidate
+        final_form_cache[word] = word
+        return word
+    except Exception:
+        final_form_cache[word] = word
+        return word
+
+def is_allowed_category(word):
+    """
+    Checks if a word (in its final form) belongs to an allowed category by searching for markers
+    in its Wiktionary page. Allowed markers include "toc-verb", "toc-adjective", "toc-noun", and "toc-proper_noun".
+    The search is case-insensitive.
+    """
+    if word in allowed_category_cache:
+        return allowed_category_cache[word]
+
+    url = f"https://simple.wiktionary.org/wiki/{word}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            allowed_category_cache[word] = False
+            return False
+        html = response.text.lower()
+        markers = ["toc-verb", "toc-adjective", "toc-noun", "toc-proper_noun"]
+        cat_markers = ['href="./category:adjectiv', 'href="./category:noun', 'href="./category:verb', 'href="./category:proper_noun']
+        if any(m in html for m in markers) or any(cm in html for cm in cat_markers):
+            allowed_category_cache[word] = True
+            return True
+        else:
+            allowed_category_cache[word] = False
+            return False
+    except Exception:
+        allowed_category_cache[word] = False
+        return False
+
+def extract_definition(word):
+    """
+    Fetches the Wiktionary page for a word and extracts its definition.
+    If an italic candidate is found in the cleaned HTML, that candidate is used as a signal
+    to discard the entry (for example, indicating a plural form) and returns an empty definition.
+    Otherwise, tokenizes the text, applies contraction rules (NOW DISABLED), filters tokens,
+    and rebuilds the definition.
+    Returns the final definition as a lowercase string.
+    """
+    url = f"https://simple.wiktionary.org/wiki/{word}"
+    try:
+        response = requests.get(url)
+    except Exception:
+        return ""
+    if response.status_code != 200:
+        return ""
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    ol = soup.find("ol")
+    if not ol:
+        return ""
+    li = ol.find("li")
+    element = li if li else ol
+
+    for span in element.find_all("span", class_="mwe-math-mathml-inline"):
+        span.decompose()
+    for img in element.find_all("img", class_="mwe-math-fallback-image-inline"):
+        alt_text = img.get("alt", "")
+        if alt_text.startswith("{\\displaystyle ") and alt_text.endswith("}"):
+            clean_text = alt_text[len("{\\displaystyle "):-1]
+        else:
+            clean_text = alt_text
+        img.replace_with(clean_text)
+
+    main_html = extract_main_definition_html(element)
+    cleaned_html_str = re.sub(r"\([^)]*\)", "", main_html)
+    cleaned_soup = BeautifulSoup(cleaned_html_str, "html.parser")
+
+    # Check for an italic candidate.
+    italic_candidate = cleaned_soup.find("i")
+    if italic_candidate:
+        candidate_text = italic_candidate.get_text(strip=True)
+        if candidate_text and "?" not in candidate_text:
+            # Discard entry if italic candidate indicates a different form (like plural)
+            return ""
+
+    full_text = cleaned_soup.get_text(separator=" ", strip=True)
+    cleaned_text = re.sub(r"[^\w\s.]", "", full_text)
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+    tokens = cleaned_text.split()
+
+    prelim_filtered = []
+    for token in tokens:
+        token = token.strip(".")
+        if len(token) == 0 or len(token) == 1 or any(ch.isdigit() for ch in token):
+            continue
+        lower_token = token.lower()
+        # MODIFICATION: The following block checking CONTRACTIONS is now effectively skipped
+        # because the CONTRACTIONS dictionary is empty.
+        if lower_token in CONTRACTIONS:
+            replacement = CONTRACTIONS[lower_token]
+            if replacement is None:
+                continue # This part won't be reached if CONTRACTIONS is empty
+            else:
+                token = replacement # This part won't be reached if CONTRACTIONS is empty
+
+        # The original token (or potentially modified if CONTRACTIONS had entries) is added.
+        # Since CONTRACTIONS is empty, the original token passing length/digit checks is always added.
+        prelim_filtered.append(token)
+
+    allowed_words = []
+    for token in prelim_filtered:
+        final = get_final_form(token) # Checks lemma form
+        if is_allowed_category(final): # Checks if lemma is noun, verb, adj, proper noun
+            allowed_words.append(final)
+
+    # Further filtering based on a small set of disallowed words and the entry word itself
+    disallowed = {"be", "to", "if", word.lower()}
+    unique_allowed = []
+    seen = set()
+    for token in allowed_words:
+        lw = token.lower()
+        if lw in disallowed:
+            continue
+        if lw not in seen:
+            seen.add(lw)
+            unique_allowed.append(lw) # Append the final form (lemma)
+
+    final_definition = " ".join(unique_allowed)
+    return final_definition
+
+def process_entry(entry):
+    """
+    Processes a single Wiktionary entry.
+    Returns a tuple (entry, definition). If the entry is not allowed or yields an empty definition, returns None for the definition.
+    """
+    # First check category for the original entry word itself
+    if not is_allowed_category(entry):
+        debug_log(f"Discarding '{entry}' (original form not allowed category).")
+        return entry, None
+
+    definition = extract_definition(entry)
+    if not definition:
+        # Definition might be empty due to italic check or no valid words remaining after filtering
+        debug_log(f"Discarding '{entry}' (yielded empty definition).")
+        return entry, None
+
+    return entry, definition
+
+
+def main():
+    entries_file = "wiktionary_entries.txt"
+    output_file = "extracted_definitions.txt"
+
+    if not os.path.exists(entries_file):
+        print(f"Error: {entries_file} not found. Please ensure the file exists in the current directory.")
+        return
+
+    try:
+        with open(entries_file, "r", encoding="utf-8") as f:
+            # Read entries, strip whitespace, ignore empty lines, and remove duplicates
+            raw_entries = [line.strip() for line in f if line.strip()]
+            entries = sorted(list(set(raw_entries))) # Use set to remove duplicates, then sort
+            print(f"Found {len(raw_entries)} lines, {len(entries)} unique entries in {entries_file}.")
+    except Exception as e:
+        print(f"Error reading {entries_file}: {e}")
+        return
+
+    extracted_definitions = {}
+    discarded_count = 0 # Keep track of discarded entries
+
+    # Use ThreadPoolExecutor for parallel processing
+    # Adjust max_workers based on your system and network limits
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        # Submit all tasks
+        future_to_entry = {executor.submit(process_entry, entry): entry for entry in entries}
+
+        # Process results as they complete, with progress bar
+        for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(entries), desc="Extracting definitions"):
+            entry = future_to_entry[future]
+            try:
+                entry_result, definition_result = future.result()
+                if definition_result:
+                    extracted_definitions[entry_result] = definition_result
+                    debug_log(f"Successfully processed '{entry_result}'.")
+                else:
+                    # Entry was processed but discarded (not allowed category or empty def)
+                    discarded_count += 1
+                    # Optional: Log discarded entries if DEBUG is False but you still want this info
+                    # print(f"Discarding '{entry_result}' (reason determined in process_entry).")
+            except Exception as e:
+                print(f"\nError processing entry '{entry}': {e}")
+                discarded_count += 1 # Count errors as discarded
+
+    print(f"\nProcessed {len(entries)} unique entries.")
+    print(f"Successfully extracted definitions for {len(extracted_definitions)} entries.")
+    print(f"Discarded {discarded_count} entries (includes errors, non-allowed categories, and empty definitions).")
+
+    # Write results to output file
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            # Sort results alphabetically by entry word before writing
+            for word in sorted(extracted_definitions.keys()):
+                f.write(f"{word}: {extracted_definitions[word]}\n")
+        print(f"Definitions saved to '{output_file}'.")
+    except Exception as e:
+        print(f"Error writing to {output_file}: {e}")
+
+
+if __name__ == "__main__":
+    # Optional: Add basic argument parsing if needed later
+    # import argparse
+    # parser = argparse.ArgumentParser(description="Extract Wiktionary definitions.")
+    # parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging.")
+    # args = parser.parse_args()
+    # DEBUG = args.debug
+    main()
